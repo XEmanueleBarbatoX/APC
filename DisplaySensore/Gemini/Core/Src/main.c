@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include <stdio.h>
 #include "ssd1306/ssd1306.h"
 #include "ssd1306/ssd1306_fonts.h"
 /* USER CODE END Includes */
@@ -33,6 +34,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define REG_TEMP		   0x00
+#define REG_CONF           0x01
+#define REG_THYST          0x02
+#define REG_TOS            0x03
+#define LM75A_TEMP_TO_REG(T) \
+    ((uint16_t)((int16_t)roundf((T) * 2.0f)) << 7)
 
 /* USER CODE END PD */
 
@@ -46,26 +53,149 @@
 I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef hlpuart1;
+UART_HandleTypeDef huart5;
+UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-static const uint8_t LMT75A_temp = 0x48 << 1;
-static const uint8_t REG_temp = 0x00;
+static const uint8_t LM75A = 0x48 << 1;
+
+
+// Stati del sistema
+typedef enum {
+    STATE_NORMAL,
+    STATE_WAIT_RESPONSE,
+    STATE_RESPONSE_RECEIVED,
+    STATE_POST_RESPONSE_WAIT
+} SystemState_t;
+
+volatile SystemState_t system_state = STATE_NORMAL;
+volatile uint8_t rx_data_ready = 1;
+uint8_t  rxBuf[8];
+uint32_t postResponseTick;
+
+static const char alarmMsg[] = "FRALRM\r\n";
+static const uint8_t alarmLen = sizeof(alarmMsg) - 1;  // 13
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_LPUART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_UART5_Init(void);
+static void MX_LPUART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
+
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// Routine per scrivere un byte
+static HAL_StatusTypeDef LM75A_WriteByte(uint8_t reg, uint8_t data) {
+    return HAL_I2C_Mem_Write(
+        &hi2c1,
+        LM75A,
+        reg,
+        I2C_MEMADD_SIZE_8BIT,
+        &data,
+        1,
+        100  /* timeout ms */
+    );
+}
+
+// Routine per scrivere due byte
+static HAL_StatusTypeDef LM75A_WriteWord(uint8_t reg, uint16_t value) {
+    uint8_t buf[2];
+    buf[0] = (value >> 8) & 0xFF;  // MSB
+    buf[1] = value & 0xFF;         // LSB (“don’t care” bits = 0)
+    return HAL_I2C_Mem_Write(
+        &hi2c1,
+        LM75A,
+        reg,
+        I2C_MEMADD_SIZE_8BIT,
+        buf,
+        2,
+        100
+    );
+}
+
+// Routine di configurazione LM75A
+void LM75A_Init(void) {
+    HAL_StatusTypeDef ret;
+
+    /* 1) Config register:
+         *    OS_F_QUE = 10 (4 conversions) → B4=1, B3=0
+         *    OS_POL   = 1 (active-high)   → B2=1
+         *    OS_COMP_INT = 1 (interrupt)  → B1=1
+         *    SHUTDOWN    = 0 (normal)     → B0=0
+         *    byte = 0b0001_0110 = 0x16
+    */
+
+	ret = LM75A_WriteByte(REG_CONF, 0x16);
+	if (ret != HAL_OK) { Error_Handler(); }
+
+    /* 2) TOS = 35°C ⇒ 35/0.5 = 70 = 0x46 */
+    /*    value register = 0x46 << 8 = 0x4600 */
+
+	// Temperatura per prova: 32 °C / 0.5 °C = 64  → 0x40
+	uint16_t temp_max = LM75A_TEMP_TO_REG(30.0f);
+    ret = LM75A_WriteWord(REG_TOS, temp_max);
+    if (ret != HAL_OK) { Error_Handler(); }
+
+    /* 3) THYST = 30°C ⇒ 30/0.5 = 60 = 0x3C ⇒ 0x3C00 */
+    uint16_t temp_min = LM75A_TEMP_TO_REG(28.0f);
+    ret = LM75A_WriteWord(REG_THYST, temp_min);
+    if (ret != HAL_OK) { Error_Handler(); }
+}
+
+/*
+// Ridefinizione funzione di CallBack interrupt su EXTI0
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == GPIO_PIN_0) {
+        // Togliere l’interrupt leggendo un registro qualunque (ad es. Temp)
+    	char temp_s[10];
+    	uint8_t msg[32];
+        uint8_t temp_raw[2];
+        int len;
+        if (HAL_I2C_Mem_Read(&hi2c1, LM75A, 0x00, I2C_MEMADD_SIZE_8BIT, temp_raw, 2, 100) == HAL_OK) {
+            int16_t raw = (temp_raw[0] << 8) | temp_raw[1];
+            // float temp = raw * 0.0078125f;  // 1/128
+            raw = raw >> 5;
+            float temp = (float)raw * 0.125f;
+
+            // gestisci l’allerta…
+            len = snprintf((char*)msg, sizeof(msg), "Interruzione: %.2f C\r\n", temp);
+            HAL_UART_Transmit(&huart2, msg, len, HAL_MAX_DELAY);
+            // HAL_Delay(1000);
+
+            sprintf(temp_s, "%.2f", temp);
+            ssd1306_SetCursor(2, 32);
+			ssd1306_WriteString(temp_s, Font_6x8, Black);
+			ssd1306_UpdateScreen();
+
+        }
+    }
+}*/
+
+// Ridefinizione Callback di ricezione UART (interrupt)
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    // if (huart->Instance == USART1 && system_state == STATE_WAIT_RESPONSE) {
+	// if (huart->Instance == USART1) {
+	if (huart->Instance == USART1) {
+        // terminatore stringa
+        //rxBuf[8] = '\0';
+        system_state = STATE_RESPONSE_RECEIVED;
+        rx_data_ready = 1;
+
+        // Preparazione USART prossima ricezione
+        HAL_UART_Receive_IT(&huart1, rxBuf, 8);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -84,6 +214,8 @@ int main(void)
   int len;
   uint8_t data_read[2];
   char temp_s[10];
+  int cont = 0;
+  float soglia = 30.0f;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -105,9 +237,18 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
-  MX_LPUART1_UART_Init();
   MX_USART2_UART_Init();
+  MX_USART1_UART_Init();
+  MX_UART5_Init();
+  MX_LPUART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
+
+  // Preparazione USART
+  // __HAL_UART_ENABLE_IT(&huart1,UART_IT_RXNE);
+  HAL_UART_Receive_IT(&huart1, rxBuf, 8);
+  LM75A_Init();
   ssd1306_Init();
 
   /* USER CODE END 2 */
@@ -122,17 +263,153 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  //HAL_UART_Transmit(&huart1, (uint8_t*)alarmMsg, 9, HAL_MAX_DELAY);
 
-	  ssd1306_Fill(White);
+	  if (rx_data_ready == 1){
+
+		  rx_data_ready = 0;
+
+		  if (system_state == STATE_WAIT_RESPONSE){
+			  system_state = STATE_RESPONSE_RECEIVED;
+		  }
+	  }
+
+	  switch(system_state) {
+
+	              case STATE_NORMAL: {
+	                  // Modalità normale: leggo e stampo la temperatura
+	                  uint8_t cmd = REG_TEMP;
+	                  if (HAL_I2C_Master_Transmit(&hi2c1, LM75A, &cmd, 1, HAL_MAX_DELAY) == HAL_OK) {
+	                      uint8_t data[2];
+	                      if (HAL_I2C_Master_Receive(&hi2c1, LM75A, data, 2, HAL_MAX_DELAY) == HAL_OK) {
+	                          int16_t raw = ((int16_t)data[0] << 8) | data[1];
+	                          raw >>= 5;
+	                          float temp = raw * 0.125f;
+	                          char temp_s[16];
+	                          snprintf(temp_s, sizeof(temp_s), "T: %.2f C", temp);
+
+	                          ssd1306_Fill(Black);
+	                          ssd1306_SetCursor(2, 2);
+	                          ssd1306_WriteString("Temperatura corrente:", Font_6x8, White);
+	                          ssd1306_SetCursor(2, 20);
+	                          ssd1306_WriteString(temp_s, Font_7x10, Black);
+	                          ssd1306_UpdateScreen();
+
+	                          if (temp > soglia){
+	                        	  cont ++;
+	                        	  if (cont == 4){
+	                        		  cont = 0;
+	                        		  // Invio l'allarme e lo stampo
+									  // const char alarmMsg[] = "ALLARME Fratm\r\n";
+
+
+
+	                        		  HAL_UART_Transmit(&huart1, (uint8_t*)alarmMsg, 8, HAL_MAX_DELAY);
+
+									  ssd1306_Fill(Black);
+									  ssd1306_SetCursor(2, 20);
+									  ssd1306_WriteString("ALLARME INCENDIO", Font_7x10, White);
+									  ssd1306_UpdateScreen();
+
+									  // passo a stato di attesa risposta
+									  system_state = STATE_WAIT_RESPONSE;
+	                        	  }
+	                          }
+	                          else{
+	                        	  cont = 0;
+	                          }
+	                      }
+	                  }
+	                  HAL_Delay(100);
+	                  break;
+	              }
+
+	              /*
+	              case STATE_ALARM_SENT: {
+	                  // Invio l'allarme e lo stampo
+	                  // const char alarmMsg[] = "ALLARME INCENDIO\r\n";
+
+
+	                  HAL_UART_Transmit(&huart1, (uint8_t*)alarmMsg, 9, HAL_MAX_DELAY);
+	                  // HAL_UART_Receive_IT(&huart1, rxBuf, 9);
+
+
+	                  ssd1306_Fill(Black);
+	                  ssd1306_SetCursor(2, 20);
+	                  ssd1306_WriteString("ALLARME INCENDIO", Font_7x10, White);
+	                  ssd1306_UpdateScreen();
+
+	                  // passo a stato di attesa risposta
+	                  // system_state = STATE_WAIT_RESPONSE;
+	                  break;
+	              }
+	  	  	  	  */
+
+
+	              case STATE_WAIT_RESPONSE: {
+
+	                  uint8_t cmd = REG_TEMP;
+					  if (HAL_I2C_Master_Transmit(&hi2c1, LM75A, &cmd, 1, HAL_MAX_DELAY) == HAL_OK) {
+						  uint8_t data[2];
+						  if (HAL_I2C_Master_Receive(&hi2c1, LM75A, data, 2, HAL_MAX_DELAY) == HAL_OK) {
+							  int16_t raw = ((int16_t)data[0] << 8) | data[1];
+							  raw >>= 5;
+							  float temp = raw * 0.125f;
+							  char temp_s[16];
+							  snprintf(temp_s, sizeof(temp_s), "T: %.2f C", temp);
+
+							  ssd1306_SetCursor(40, 45);
+							  ssd1306_WriteString(temp_s, Font_7x10, Black);
+							  ssd1306_UpdateScreen();
+
+						  }
+					  }
+					  HAL_Delay(100);
+					  break;
+	              }
+
+	              case STATE_RESPONSE_RECEIVED: {
+	                  // Appena arriva la risposta UART (gestita in RxCpltCallback)
+	                  ssd1306_Fill(Black);
+	                  ssd1306_SetCursor(2, 12);
+	                  ssd1306_WriteString((char*)rxBuf, Font_6x8, Black);
+	                  ssd1306_UpdateScreen();
+
+	                  // inizio conteggio 5 secondi
+	                  postResponseTick = HAL_GetTick();
+	                  system_state = STATE_POST_RESPONSE_WAIT;
+	                  break;
+	              }
+
+	              case STATE_POST_RESPONSE_WAIT: {
+	                  // Aspetto 5 secondi
+	                  if ((HAL_GetTick() - postResponseTick) >= 5000) {
+	                      system_state = STATE_NORMAL;
+	                  }
+	                  break;
+	              }
+
+	              default: {
+	            	  break;
+	              }
+
+	          }
+
+/*
+	  ssd1306_SetCursor(2, 2);
+	  ssd1306_WriteString("Temperatura corrente:", Font_6x8, White);
 	  ssd1306_UpdateScreen();
 
-	  buf[0] = REG_temp;
-	  check = HAL_I2C_IsDeviceReady(&hi2c1, LMT75A_temp, 5, HAL_MAX_DELAY);
-	  ret = HAL_I2C_Master_Transmit(&hi2c1, LMT75A_temp, buf, 1, HAL_MAX_DELAY);
+	  // ssd1306_Fill(White);
+	  // ssd1306_UpdateScreen();
+
+	  buf[0] = REG_TEMP;
+	  check = HAL_I2C_IsDeviceReady(&hi2c1, LM75A, 5, HAL_MAX_DELAY);
+	  ret = HAL_I2C_Master_Transmit(&hi2c1, LM75A, buf, 1, HAL_MAX_DELAY);
 	  if( ret != HAL_OK){
 		 strcpy((char*)buf, "Error Tx\r\n");
 		} else{
-			ret = HAL_I2C_Master_Receive(&hi2c1, LMT75A_temp, data_read, 2, HAL_MAX_DELAY); // <--- AGGIUNTA FONDAMENTALE QUI!
+			ret = HAL_I2C_Master_Receive(&hi2c1, LM75A, data_read, 2, HAL_MAX_DELAY); // <--- AGGIUNTA FONDAMENTALE QUI!
 
 			if (ret != HAL_OK) {
 				strcpy((char*)buf, "Error Rx\r\n"); // Gestione errore di ricezione
@@ -150,15 +427,33 @@ int main(void)
 				// Formatta la stringa per la UART
 				len = snprintf((char*)msg, sizeof(msg), "Temp: %.2f C\r\n", temp_c);
 				HAL_UART_Transmit(&huart2, msg, len, HAL_MAX_DELAY);
-				HAL_Delay(1000);
+				HAL_Delay(100);
 
 				sprintf(temp_s, "%.2f", temp_c);
-
-
-				ssd1306_SetCursor(2, 12);
-				ssd1306_WriteString(temp_s, Font_6x8, Black);
+				ssd1306_SetCursor(2, 30);
+				ssd1306_WriteString(temp_s, Font_7x10, Black);
 				ssd1306_UpdateScreen();
 
+				if (temp_c > soglia) {
+					cont++;
+					if (cont == 4){
+						len = snprintf((char*)msg, sizeof(msg), "INTERRUZIONE: %.2f C\r\n", temp_c);
+						HAL_UART_Transmit(&huart2, msg, len, HAL_MAX_DELAY);
+						cont = 0;
+
+						ssd1306_Fill(Black);
+						ssd1306_UpdateScreen();
+						ssd1306_SetCursor(2, 20);
+						ssd1306_WriteString("ALLARME INCENDIO", Font_7x10, White);
+						ssd1306_UpdateScreen();
+						HAL_Delay(10000);
+						ssd1306_Fill(Black);
+						ssd1306_UpdateScreen();
+					}
+				}
+				else{
+					cont = 0;
+				}
 
 			}
 		}
@@ -314,6 +609,102 @@ static void MX_LPUART1_UART_Init(void)
 }
 
 /**
+  * @brief UART5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART5_Init(void)
+{
+
+  /* USER CODE BEGIN UART5_Init 0 */
+
+  /* USER CODE END UART5_Init 0 */
+
+  /* USER CODE BEGIN UART5_Init 1 */
+
+  /* USER CODE END UART5_Init 1 */
+  huart5.Instance = UART5;
+  huart5.Init.BaudRate = 115200;
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Mode = UART_MODE_TX_RX;
+  huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart5.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart5.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart5.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart5.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart5, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart5, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART5_Init 2 */
+
+  /* USER CODE END UART5_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -376,6 +767,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
