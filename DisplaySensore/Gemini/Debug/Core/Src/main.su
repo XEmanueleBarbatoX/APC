@@ -1,0 +1,13 @@
+../Core/Src/main.c:99:26:LM75A_WriteByte	32	static
+../Core/Src/main.c:112:26:LM75A_WriteWord	40	static
+../Core/Src/main.c:128:6:LM75A_Init	16	static
+../Core/Src/main.c:186:6:HAL_UART_RxCpltCallback	16	static
+../Core/Src/main.c:205:5:main	144	static
+../Core/Src/main.c:474:6:SystemClock_Config	88	static
+../Core/Src/main.c:521:13:MX_I2C1_Init	8	static
+../Core/Src/main.c:569:13:MX_LPUART1_UART_Init	8	static
+../Core/Src/main.c:616:13:MX_UART5_Init	8	static
+../Core/Src/main.c:664:13:MX_USART1_UART_Init	8	static
+../Core/Src/main.c:712:13:MX_USART2_UART_Init	8	static
+../Core/Src/main.c:760:13:MX_GPIO_Init	32	static
+../Core/Src/main.c:786:6:Error_Handler	4	static,ignoring_inline_asm
