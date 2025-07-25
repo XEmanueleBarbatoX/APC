@@ -61,8 +61,7 @@ static const uint8_t LM75A = 0x48 << 1;
 typedef enum {
 	STATE_NORMAL,
 	STATE_WAIT_RESPONSE,
-	STATE_RESPONSE_RECEIVED,
-	STATE_POST_RESPONSE_WAIT
+	STATE_RESPONSE_RECEIVED
 } SystemState_t;
 
 volatile SystemState_t system_state = STATE_NORMAL;
@@ -91,11 +90,7 @@ static void MX_LPUART1_UART_Init(void);
 
 // Ridefinizione Callback di ricezione UART (interrupt)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-	// if (huart->Instance == USART1 && system_state == STATE_WAIT_RESPONSE) {
-	// if (huart->Instance == USART1) {
 	if (huart->Instance == USART1) {
-		// terminatore stringa
-		//rxBuf[8] = '\0';
 		system_state = STATE_RESPONSE_RECEIVED;
 		rx_data_ready = 1;
 
@@ -211,7 +206,6 @@ int main(void) {
 						if (cont == 4) {
 							cont = 0;
 							// Invio l'allarme e lo stampo
-							// const char alarmMsg[] = "ALLARME Fratm\r\n";
 
 							HAL_UART_Transmit(&huart1, (uint8_t*) alarmMsg, 8,
 							HAL_MAX_DELAY);
